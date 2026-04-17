@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Callable
 
 from .statuses import Status, FailResult
 from .task.fetch_data import FetchData
@@ -7,6 +8,8 @@ from .task.store_data import StoreData
 from .task.task import Task
 
 logger = logging.getLogger(__name__)
+
+FlowEventHandler = Callable[[str, dict], None]
 
 
 class FlowManager:
@@ -17,9 +20,11 @@ class FlowManager:
         tasks: list[Task] | None = None,
         conditions: list[bool] | None = None,
         fail_result: list[FailResult] | None = None,
+        event_handler: FlowEventHandler | None = None,
     ):
         self.id = flow_id
         self.name = name
+        self._event_handler = event_handler
         self.tasks = tasks or [FetchData(), ProcessData(), StoreData()]
         if not self.tasks:
             raise ValueError("Flow must contain at least one task")
@@ -42,6 +47,11 @@ class FlowManager:
             raise ValueError(
                 "fail_result length must match number of task transitions"
             )
+
+    def _emit_event(self, event: str, **payload):
+        if self._event_handler is None:
+            return
+        self._event_handler(event, payload)
 
     def _is_task_success(self, status) -> bool:
         if isinstance(status, Status):
@@ -78,32 +88,58 @@ class FlowManager:
         }
 
     async def run(self) -> dict | None:
+        self._emit_event("flow_started")
+
         outcomes = []
         for index, task in enumerate(self.tasks):
+            self._emit_event("task_started", index=index, task_name=task.name)
             status = await task.execute()
-            if status is Status.FAILED:
-                if index >= len(self.fail_result):
-                    logger.error("Task failed: %s", task.name)
-                    return None
-
-                fail_result = self.fail_result[index]
-                if fail_result is FailResult.END:
-                    logger.error("Task failed: %s", task.name)
-                    return None
-                if fail_result is FailResult.FORWARD:
-                    logger.warning("Task failed: %s, moving to next task", task.name)
+            is_success = self._is_task_success(status)
+            self._emit_event(
+                "task_finished",
+                index=index,
+                task_name=task.name,
+                status=getattr(status, "value", str(status)),
+                success=is_success,
+            )
 
             outcomes.append(status)
 
-            if index < len(self.conditions):
-                condition = self.conditions[index]
+            if index >= len(self.conditions):
+                continue
 
-                if not condition:
-                    logger.error(
-                        "Condition failed after %s", task.name
-                    )
-                    return None
+            expected_success = self.conditions[index]
+            condition_passed = is_success == expected_success
+            self._emit_event(
+                "condition_evaluated",
+                index=index,
+                source_task=task.name,
+                passed=condition_passed,
+                expected_result="successful" if expected_success else "failed",
+                actual_result="successful" if is_success else "failed",
+            )
+
+            if condition_passed:
+                continue
+
+            fail_result = self.fail_result[index]
+            if fail_result is FailResult.FORWARD:
+                logger.warning(
+                    "Condition failed after %s, moving to next task", task.name
+                )
+                continue
+
+            logger.error("Condition failed after %s", task.name)
+            self._emit_event(
+                "flow_failed",
+                index=index,
+                task_name=task.name,
+                error=f"Condition failed after {task.name}",
+            )
+            return None
 
         logger.info("Flow completed")
+        flow_payload = self._build_completed_flow_payload(outcomes)
+        self._emit_event("flow_completed", payload=flow_payload)
 
-        return self._build_completed_flow_payload(outcomes)
+        return flow_payload

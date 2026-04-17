@@ -4,6 +4,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from flow.statuses import FailResult
 from flow.flow_manager import FlowManager
+from flow.flow_tracker import flow_tracker
 from endpoints.utils import TASK_REGISTRY, FAIL_RESULT_REGISTRY
 
 router = APIRouter(prefix="/flow", tags=["flow"])
@@ -51,7 +52,7 @@ def _build_tasks(task_names: list[str]) -> list:
         task_cls = TASK_REGISTRY.get(_normalize_task_name(task_name))
         if task_cls is None:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"Unsupported task '{task_name}'",
             )
         tasks.append(task_cls())
@@ -66,7 +67,7 @@ def _build_fail_results(fail_results: list[str]) -> list[FailResult]:
         )
         if parsed_result is None:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"Unsupported fail_result '{fail_result}'",
             )
         parsed.append(parsed_result)
@@ -81,7 +82,7 @@ def _build_fail_results(fail_results: list[str]) -> list[FailResult]:
         status.HTTP_500_INTERNAL_SERVER_ERROR: {
             "description": "Flow execution failed"
         },
-        status.HTTP_422_UNPROCESSABLE_ENTITY: {
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {
             "description": "Invalid flow configuration"
         },
     },
@@ -89,26 +90,64 @@ def _build_fail_results(fail_results: list[str]) -> list[FailResult]:
 async def run_flow(
         payload: FlowRunRequest = Body(default=FlowRunRequest()),
 ):
+    def _event_handler(event: str, event_payload: dict):
+        flow_tracker.handle_event(payload.flow_id, event, event_payload)
+
     flow_kwargs = {
         "flow_id": payload.flow_id,
         "name": payload.name,
         "tasks": _build_tasks(payload.tasks),
         "conditions": payload.conditions,
         "fail_result": _build_fail_results(payload.fail_result),
+        "event_handler": _event_handler,
     }
 
     try:
         flow_manager = FlowManager(**flow_kwargs)
     except ValueError as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),
         ) from exc
 
-    flow_response = await flow_manager.run()
+    flow_tracker.initialize_flow(
+        flow_id=flow_manager.id,
+        name=flow_manager.name,
+        tasks=flow_manager.tasks,
+        conditions=flow_manager.conditions,
+        fail_result=flow_manager.fail_result,
+    )
+
+    try:
+        flow_response = await flow_manager.run()
+    except Exception as exc:
+        flow_tracker.mark_failed(flow_manager.id, str(exc))
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"flow_id": flow_manager.id, "status": "failed"},
+        )
+
     if flow_response is None:
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"flow_id": flow_manager.id, "status": "failed"},
         )
     return flow_response
+
+
+@router.get(
+    "/{flow_id}",
+    status_code=status.HTTP_200_OK,
+    responses={
+        status.HTTP_200_OK: {"description": "Tracked flow details"},
+        status.HTTP_404_NOT_FOUND: {"description": "Flow not found"},
+    },
+)
+async def get_flow(flow_id: str):
+    flow_data = flow_tracker.get_flow(flow_id)
+    if flow_data is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Flow '{flow_id}' not found",
+        )
+    return flow_data
